@@ -62,11 +62,16 @@ class Sshd {
     this.pendingKey = null;   // the other side's last ssh.key line
     this.busy = false;
     this.message = '';
+    this.keyWork = Promise.resolve();
+    this.keyEpoch = 0;
+    this.forgotten = new Set();
     this.lastInfo = null;
     this.link.on(T.SSH_KEY, (m) => this._onKey(m));
     this.link.on(T.SSH_FORGET, () => this._forget());
-    this.link.on('closed', () => { this.pendingKey = null; this.lastInfo = null; this.onChange(); });
-    this.refresh();
+    this.link.on('closed', () => { this.keyEpoch++; this.pendingKey = null; this.lastInfo = null; this.onChange(); });
+    this.link.on('welcome', () => { this.forgotten.delete(this.peerId()); });
+    this.refresh().catch((e) => { this.message = e.message; this.onChange(); });
+    if (!this.cfg.allowMac) this.apply(); // also clean up keys left by older versions
   }
 
   get cfg() {
@@ -81,64 +86,82 @@ class Sshd {
   }
 
   peerId() {
-    const s = this.link.snapshot().session;
-    return s && s.id ? String(s.id) : 'peer';
+    const snap = this.link.snapshot();
+    const id = snap.session && snap.session.id || snap.paired && snap.paired.macId;
+    return typeof id === 'string' && id ? id : null;
+  }
+
+  _queue(action) {
+    const work = this.keyWork.then(action).catch((e) => {
+      this.message = 'SSH access could not be updated: ' + e.message;
+      this.onChange();
+      return false;
+    });
+    this.keyWork = work;
+    return work;
   }
 
   async _onKey(m) {
     const pub = typeof m.pub === 'string' ? m.pub.trim().split(/\s+/).slice(0, 2).join(' ') : '';
-    if (!/^(ssh-ed25519|ecdsa-sha2-\S+|ssh-rsa) [A-Za-z0-9+/=]+$/.test(pub)) return;
-    this.pendingKey = pub;
-    await this.apply();
+    const id = this.peerId();
+    if (!id || !/^[A-Za-z0-9._-]{1,128}$/.test(id) || this.forgotten.has(id) || !/^(ssh-ed25519|ecdsa-sha2-\S+|ssh-rsa) [A-Za-z0-9+/=]+$/.test(pub)) return;
+    this.pendingKey = { id, pub };
+    return this.apply();
   }
 
-  // Called on a key from the other side and when the switch changes.
-  async apply() {
-    if (!this.pendingKey) return this.onChange();
-    if (!this.cfg.allowMac) return this._info(false, 'not_allowed');
-    await this.refresh();
-    if (this.service !== 'running') return this._info(false, 'remote_login_off');
-    const line = OPTIONS + ' ' + this.pendingKey + ' macshare:' + this.peerId();
-    const digest = crypto.createHash('sha256').update(line).digest('hex');
-    if (this.cfg.installedKey !== digest || !this._has(line)) {
-      try {
-        this._install(line);
-        this.cfg.installedKey = digest;
-        this.save();
-        this.message = '';
-      } catch (e) {
-        this.message = 'Couldn’t add {name}’s key: ' + e.message;
-        return this._info(false, 'not_allowed');
-      }
-    }
-    this._info(true);
+  apply() {
+    if (!this.cfg.allowMac) return this._forget(null, { keepPending: true });
+    const key = this.pendingKey, epoch = this.keyEpoch;
+    if (!key) return Promise.resolve(true);
+    return this._queue(async () => {
+      const current = () => this.cfg.allowMac && epoch === this.keyEpoch && !this.forgotten.has(key.id);
+      if (!current()) return false;
+      await this.refresh();
+      if (!current()) return false;
+      if (this.service !== 'running') { await this._info(false, 'remote_login_off', key.id); return false; }
+      const line = OPTIONS + ' ' + key.pub + ' macshare:' + key.id;
+      await this._changeKeys(key.id, line);
+      // Off/Forget/disconnect may have arrived while an administrator prompt was open.
+      if (!current()) { await this._changeKeys(key.id); return false; }
+      this.cfg.installedKey = crypto.createHash('sha256').update(line).digest('hex');
+      this.save();
+      this.message = '';
+      await this._info(true, undefined, key.id);
+      return true;
+    });
   }
 
-  _has(line) {
-    try { return fs.readFileSync(KEYS, 'utf8').split('\n').includes(line); } catch (_) { return false; }
-  }
-
-  // Replace our marked line (sshd wants ~/.ssh 700 and the file 600).
-  _install(line) {
-    const marker = ' macshare:' + this.peerId();
-    fs.mkdirSync(path.dirname(KEYS), { recursive: true, mode: 0o700 });
-    const keep = fs.existsSync(KEYS) ? fs.readFileSync(KEYS, 'utf8').split(/\r?\n/).filter((l) => l && !l.endsWith(marker)) : [];
-    fs.writeFileSync(KEYS, keep.concat(line).join('\n') + '\n', { mode: 0o600 });
-    fs.chmodSync(KEYS, 0o600);
-  }
-
-  _forget() {
-    this.pendingKey = null;
-    if (!this.cfg.installedKey) return this.onChange();
-    const marker = ' macshare:' + this.peerId();
-    try {
-      if (fs.existsSync(KEYS)) fs.writeFileSync(KEYS, fs.readFileSync(KEYS, 'utf8').split(/\r?\n/).filter((l) => l && !l.endsWith(marker)).join('\n') + '\n');
+  // null removes every app-owned marker; a device id removes only that device's key.
+  _forget(id = this.peerId(), { block = false, keepPending = false } = {}) {
+    if (id === null || this.pendingKey && this.pendingKey.id === id) this.keyEpoch++;
+    if (block && id !== null) this.forgotten.add(id);
+    if (!keepPending && (id === null || this.pendingKey && this.pendingKey.id === id)) this.pendingKey = null;
+    return this._queue(async () => {
+      await this._changeKeys(id);
       this.cfg.installedKey = '';
       this.save();
-    } catch (e) {
-      this.message = '{Name}’s key is still installed: ' + e.message;
-    }
-    this.onChange();
+      this.message = '';
+      await this._info(false, 'not_allowed', id);
+      return true;
+    });
+  }
+
+  forget(id) {
+    // Pairing accepts opaque IDs, including old peers that cannot request SSH.
+    if (typeof id !== 'string' || !id) return Promise.resolve(false);
+    return this._forget(id, { block: true });
+  }
+
+  async _changeKeys(id, line = '') {
+    const remove = (l) => id === null ? / macshare:[^\s]+$/.test(l) : l.endsWith(' macshare:' + id);
+    let lines;
+    try { lines = fs.readFileSync(KEYS, 'utf8').split(/\r?\n/).filter(Boolean); }
+    catch (e) { if (e.code !== 'ENOENT') throw e; lines = []; }
+    if (line && lines.includes(line) && lines.filter(remove).length === 1) return;
+    if (!line && !lines.some(remove)) return;
+    fs.mkdirSync(path.dirname(KEYS), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(KEYS, lines.filter((l) => !remove(l)).concat(line ? [line] : []).join('\n') + '\n', { mode: 0o600 });
+    fs.chmodSync(KEYS, 0o600);
   }
 
   // Install (apt, dnf, zypper or pacman), enable and start the OpenSSH server: one password prompt.
@@ -164,13 +187,15 @@ class Sshd {
     await this.apply();
   }
 
-  _info(enabled, why) {
+  _info(enabled, why, id = this.peerId()) {
     const msg = { t: T.SSH_INFO, enabled };
     if (enabled) {
       msg.user = os.userInfo().username;
       msg.port = sshPort();
       msg.hostKeys = hostKeys();
     } else msg.why = why;
+    if (id !== null && this.peerId() !== id) return;
+    if (enabled && (!this.cfg.allowMac || this.forgotten.has(id))) return;
     this.link.send(msg);
     this.lastInfo = { enabled, why: why || '' };
     this.onChange();

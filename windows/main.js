@@ -214,6 +214,7 @@ function start() {
   // Every feature below talks to it as it talked to link.js.
   const guest = new Link({
     device,
+    revokeAccess: (id) => sshd ? sshd.forget(id) : Promise.resolve(false),
     blocked: () => link.hosting || !!(hostServer && hostServer.phoneHolds()), // a phone keeps it while it may come back
     store: {
       load: () => {
@@ -403,6 +404,7 @@ async function startHost(guest) {
     discovery.self.port = server.port;
     // A phone's hello takes the session: the computer we're a guest of is dropped (yieldTo).
     const pairing = new HostPairing(server, { id: device.id, name: device.name, fp: id.fp }, { busy: () => guest.authed, yieldTo: () => guest.yieldSession() });
+    pairing.revokeAccess = (id) => sshd ? sshd.forget(id) : Promise.resolve(false);
     pairing.on('request', showMain); // a code to compare: bring the window up
     link.attachHost(server, pairing);
     hostServer = server;

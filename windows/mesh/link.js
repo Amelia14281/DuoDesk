@@ -29,6 +29,7 @@ class Link {
   //   ble: BleGuest | null (blepipe.js)
   constructor(opts) {
     this.device = opts.device;
+    this.revokeAccess = opts.revokeAccess;
     this.blocked = opts.blocked || (() => false);
     this.busy = opts.busy || (() => true);
     this.destroyed = false;
@@ -141,12 +142,18 @@ class Link {
   }
 
   forget() {
-    this.stopped = null;
-    clearTimeout(this.timers.reconnect);
-    this._closeSocket();
-    this.store.clear();
-    this.pairing = null;
-    this._setStatus('not_paired', '');
+    const pairing = this.pairing;
+    const remove = () => {
+      if (this.pairing !== pairing) return false;
+      this.stopped = null;
+      clearTimeout(this.timers.reconnect);
+      this._closeSocket();
+      this.store.clear();
+      this.pairing = null;
+      this._setStatus('not_paired', '');
+      return true;
+    };
+    return this.revokeAccess && pairing ? this.revokeAccess(pairing.macId).then((ok) => ok && remove()) : remove();
   }
 
   // A phone took the session (hostpair.js): drop the computer we're a guest of. Reconnecting
@@ -416,8 +423,9 @@ class Link {
     const code = msg.code;
     if (this.mode === 'pair') return this._pairFailed(PAIR_ERRORS[code] || 'Pairing failed (' + code + ').');
     if (code === P.E.BAD_TOKEN) {
-      this.forget();
-      this._setStatus('not_paired', 'Your Mac forgot {me}. Pair again.');
+      Promise.resolve(this.forget()).then((ok) => {
+        if (ok) this._setStatus('not_paired', 'Your Mac forgot {me}. Pair again.');
+      });
       return;
     }
     if (code === P.E.VERSION_MISMATCH) this.lastError = PAIR_ERRORS[code];

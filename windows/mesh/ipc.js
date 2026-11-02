@@ -57,10 +57,9 @@ function setupIpc(ctx) {
   handle('copyText', (text) => typeof text === 'string' && text.length < 1000 && clipboard.writeText(text));
   handle('confirmCode', () => link.confirmCode());
   handle('cancelPair', () => { ctx.cancelPhoneInvite(); link.cancelPair(); });
-  handle('forget', () => {
+  handle('forget', async () => {
     const id = hub.selectedId;
-    link.forget();
-    if (id) kvm.forgetDevice(id);
+    if (await link.forget() && id) kvm.forgetDevice(id);
   });
   // Disconnect (either side of the session); Connect again / Take over the computer we're a guest of.
   handle('disconnect', () => link.disconnect());
@@ -78,10 +77,9 @@ function setupIpc(ctx) {
   handle('forgetGuest', (id) => typeof id === 'string' && link.forgetGuest(id));
   // Devices (docs/mesh.md): the selected one takes the one-to-one features; Forget drops one device.
   handle('setActivePeer', (id) => typeof id === 'string' && hub.select(id.slice(0, 64)));
-  handle('forgetPeer', (id) => {
+  handle('forgetPeer', async (id) => {
     if (typeof id !== 'string') return;
-    hub.forgetPeer(id.slice(0, 64));
-    kvm.forgetDevice(id.slice(0, 64));
+    if (await hub.forgetPeer(id.slice(0, 64))) kvm.forgetDevice(id.slice(0, 64));
   });
   handle('wakePeer', (id) => typeof id === 'string' && wake.wake(id));
   handle('setWake', (on) => wake.set(on === true)); // A switch

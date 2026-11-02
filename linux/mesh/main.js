@@ -175,7 +175,7 @@ function start() {
   // and the hub that joins them to the host side (startHost attaches it) and to the features:
   // pooled ones (clipboard, notifications) use hub.bus, the one-to-one ones use `link`, the facade of
   // the selected device.
-  links = new LinkManager({ device, resolveAddress: (macId) => discovery.get(macId) });
+  links = new LinkManager({ device, revokeAccess: (id) => sshd ? sshd.forget(id) : Promise.resolve(false), resolveAddress: (macId) => discovery.get(macId) });
   mesh = new Mesh({ selfId: device.id });
   hub = new Hub({ device, links, mesh });
   link = hub.facade;
@@ -368,6 +368,7 @@ async function startHost(tries = 0) {
     const server = new Server(id);
     discovery.self.port = server.port;
     const pairing = new HostPairing(server, { id: device.id, name: device.name, fp: id.fp });
+    pairing.revokeAccess = (id) => sshd ? sshd.forget(id) : Promise.resolve(false);
     pairing.on('request', showMain); // a code to compare: bring the window up
     hub.attachHost(server, pairing);
     hostServer = server;

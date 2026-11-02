@@ -122,12 +122,14 @@ class Hub extends EventEmitter {
 
   // Forget a device: its guest link (we dialled it) and its host entry (it dialled us), both.
   forgetPeer(id) {
-    if (this.links.get(id)) this.links.forget(id);
-    if (this.pairing && this.pairing.list().some((x) => x.id === id)) this.pairing.forget(id);
+    const work = [];
+    if (this.links.get(id)) work.push(this.links.forget(id));
+    if (this.pairing && this.pairing.list().some((x) => x.id === id)) work.push(this.pairing.forget(id));
+    return Promise.all(work).then((results) => results.every((ok) => ok !== false));
   }
 
   forgetGuest(id) {
-    if (this.pairing) this.pairing.forget(id);
+    if (this.pairing) return this.pairing.forget(id);
   }
 
   // Makes `id` the selected device. False when that device is not connected.
@@ -467,7 +469,7 @@ class Hub extends EventEmitter {
       confirmCode: () => hub.confirmCode(),
       cancelPair: () => hub.cancelPair(),
       forget: () => {
-        if (hub.selectedId) hub.forgetPeer(hub.selectedId);
+        if (hub.selectedId) return hub.forgetPeer(hub.selectedId);
       },
       respondPair: (allow) => hub.respondPair(allow),
       forgetGuest: (id) => hub.forgetGuest(id),

@@ -193,7 +193,7 @@ class Peer {
     if (this.pairing && this.pairing.pending) this.pairing.respond(false);
     else this.link.cancelPair();
   }
-  forget() { this.link.forget(); }
+  forget() { return this.link.forget(); }
   // Connect again or Take over the computer we're a guest of.
   connect(takeover) {
     if (this.hosting) this.server.release(); // switching from a guest of ours to our host
@@ -212,7 +212,7 @@ class Peer {
 
   // ---- host side ----
   respondPair(allow) { if (this.pairing) this.pairing.respond(allow); }
-  forgetGuest(id) { if (this.pairing) this.pairing.forget(id); }
+  forgetGuest(id) { if (this.pairing) return this.pairing.forget(id); }
 
   _deliver(msg) {
     if (!this._allowed(msg.t)) return;

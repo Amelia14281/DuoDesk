@@ -27,9 +27,10 @@ class LinkManager extends EventEmitter {
   // opts: device {id, name}; storage {read, write, remove?} (default: store.js); hostPairing: the
   //   Pairing (hostpair.js) of this PC, to know which devices hold us as their host (mutual pairs);
   //   resolveAddress(macId) -> {address, port}|null; inboundWaitMs (default P.INBOUND_WAIT_MS).
-  constructor({ device, storage, hostPairing = null, resolveAddress = null, inboundWaitMs = P.INBOUND_WAIT_MS } = {}) {
+  constructor({ device, storage, revokeAccess, hostPairing = null, resolveAddress = null, inboundWaitMs = P.INBOUND_WAIT_MS } = {}) {
     super();
     this.device = device;
+    this.revokeAccess = revokeAccess;
     this.storage = storage || require('./store'); // the mesh's own files (store.js)
     this.hostPairing = hostPairing;
     this.resolveAddress = resolveAddress;
@@ -93,8 +94,9 @@ class LinkManager extends EventEmitter {
   forget(id) {
     const link = this.links.get(id);
     if (!link) return;
-    link.forget(); // store.clear() → _drop(): removes the entry, the link, emits 'remove'
-    link.destroy();
+    const result = link.forget(); // store.clear() → _drop(): removes the entry and emits 'remove'
+    const done = (ok) => { if (ok) link.destroy(); return ok; };
+    return result && typeof result.then === 'function' ? result.then(done) : done(result);
   }
 
   // A host an already trusted device introduced us to (autojoin.js, mesh.intro.grant): the same entry
@@ -201,6 +203,7 @@ class LinkManager extends EventEmitter {
     let link = null;
     link = new Link({
       device: this.device,
+      revokeAccess: this.revokeAccess,
       ble: this.ble,
       blocked: () => this._blocked(link),
       busy: () => this._busy(link),

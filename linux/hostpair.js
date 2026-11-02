@@ -45,10 +45,14 @@ class Pairing extends EventEmitter {
   }
 
   forget(id) {
-    this.paired = this.paired.filter((x) => x.id !== id);
-    this._save();
-    this.server.closeDevice(id, P.E.BAD_TOKEN, 'This computer forgot the pairing');
-    this.emit('change');
+    const remove = () => {
+      this.paired = this.paired.filter((x) => x.id !== id);
+      this._save();
+      this.server.closeDevice(id, P.E.BAD_TOKEN, 'This computer forgot the pairing');
+      this.emit('change');
+      return true;
+    };
+    return this.revokeAccess ? this.revokeAccess(id).then((ok) => ok && remove()) : remove();
   }
 
   // Local Allow / Deny.

@@ -45,13 +45,16 @@ class Smb {
     this.mac = null;        // {share, user, password} from the other computer's smb.offer (memory only)
     this.mounted = null;    // {uri, path} once its folder is connected here
     this.mountMessage = '';
+    this.shareWork = Promise.resolve();
+    this.shareEpoch = 0;
+    this.revoking = false;
     this.sharePath = '';
 
     this.link.on('welcome', () => this._offer());
     this.link.on(T.SMB_STATE, (m) => { if (m.share === SHARE) { this.peerState = { mounted: !!m.mounted, error: m.error || '' }; this.onChange(); } });
     this.link.on(T.SMB_OFFER, (m) => this._onMacOffer(m));
     this.link.on(T.SMB_REVOKE, (m) => this._unmount(m.share));
-    this.checkShare();
+    this._queueShare(() => this._reconcileShare());
   }
 
   get cfg() {
@@ -82,24 +85,42 @@ class Smb {
 
   _offer() {
     const c = this._creds();
-    if (this.cfg.shareOn && c) this.link.send({ t: T.SMB_OFFER, share: SHARE, user: c.user, password: c.password, port: 445 });
+    if (this.cfg.shareOn && !this.revoking && c) this.link.send({ t: T.SMB_OFFER, share: SHARE, user: c.user, password: c.password, port: 445 });
   }
 
-  // One switch: on → share the folder (default ~/MacShare); the password prompt only comes the
-  // first time or after the folder changed. Off → the other computer disconnects it; the share and
-  // the account stay, so switching on again needs no prompt.
-  async setShareOn(on) {
-    if (this.busy) return;
-    if (!on) {
-      this.cfg.shareOn = false;
+  async _reconcileShare() {
+    await this.checkShare();
+    if (!this.cfg.shareOn && (this.sharePath || fs.existsSync(this.credFile))) {
+      // Older versions saved Off without revoking native access. Show it as active
+      // until cleanup succeeds, including when the administrator prompt is declined.
+      this.cfg.shareOn = true;
+      this.revoking = true;
       this.save();
-      this.link.send({ t: T.SMB_REVOKE, share: SHARE });
-      this.peerState = null;
-      return this.onChange();
+      await this._unshare();
     }
+  }
+
+  _queueShare(action) {
+    const work = this.shareWork.then(action).catch((e) => { this._msg(e.message); return false; });
+    this.shareWork = work;
+    return work;
+  }
+
+  // Off revokes native access, including an Off requested while setup is in progress.
+  setShareOn(on) {
+    if (!on) return this.unshare();
+    const epoch = this.shareEpoch;
+    return this._queueShare(() => epoch === this.shareEpoch && this._setShareOn());
+  }
+
+  async _setShareOn() {
+    if (this.busy) return;
+    this.revoking = false;
+    const epoch = this.shareEpoch;
     const folder = this.cfg.shareFolder || this.defaultFolder;
     try { fs.mkdirSync(folder, { recursive: true }); } catch (e) { return this._msg('Can’t create ' + folder + ': ' + e.message); }
     await this.checkShare();
+    if (epoch !== this.shareEpoch) return;
     if (this._creds() && this.sharePath === folder) {
       this.cfg.shareOn = true;
       this.cfg.shareFolder = folder;
@@ -108,7 +129,7 @@ class Smb {
       this._offer();
       return this.onChange();
     }
-    await this.share(folder);
+    await this._share(folder);
   }
 
   // Choose… a different folder: shared right away if sharing is on, else remembered for later.
@@ -121,7 +142,16 @@ class Smb {
   }
 
   // One script as root: Samba, the account and its password, the share, the firewall.
-  async share(folder) {
+  share(folder) {
+    const epoch = this.shareEpoch;
+    return this._queueShare(() => {
+      if (epoch !== this.shareEpoch) return false;
+      this.revoking = false;
+      return this._share(folder);
+    });
+  }
+
+  async _share(folder) {
     if (this.busy) return;
     if (!folder || !fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) return this._msg('Pick a folder first');
     if (/[\n\r]/.test(folder)) return this._msg('That folder’s name can’t be shared');
@@ -172,28 +202,48 @@ for s in smbd smb; do if systemctl cat $s >/dev/null 2>&1; then systemctl enable
   }
 
   // Stop sharing: the other computer disconnects; the share and the account are removed (root).
-  async unshare() {
-    if (this.busy) return;
+  unshare() {
+    this.shareEpoch++;
+    this.revoking = true;
+    return this._queueShare(() => this._unshare());
+  }
+
+  async _unshare() {
     this.link.send({ t: T.SMB_REVOKE, share: SHARE });
     this._busy('remove');
     try {
       await run('pkexec', ['sh', '-c', `
+set -e
 rm -f ${CONF}
-[ -f /etc/samba/smb.conf ] && sed -i '\\#^include = ${CONF}$#d' /etc/samba/smb.conf
-smbpasswd -x ${USER} >/dev/null 2>&1 || true
-userdel ${USER} 2>/dev/null || true
-smbcontrol all reload-config 2>/dev/null || true
+if [ -f /etc/samba/smb.conf ]; then sed -i '\\#^include = ${CONF}$#d' /etc/samba/smb.conf; fi
+if command -v pdbedit >/dev/null 2>&1; then
+  accounts=$(pdbedit -L)
+  if printf '%s\\n' "$accounts" | grep -q '^${USER}:'; then smbpasswd -x ${USER}; fi
+fi
+if id ${USER} >/dev/null 2>&1; then userdel ${USER}; fi
+# A reload does not close existing clients. Close only our share, never unrelated shares.
+if pgrep -x smbd >/dev/null; then
+  smbcontrol smbd reload-config
+  smbcontrol smbd close-share ${SHARE}
+else
+  status=$?
+  [ "$status" -eq 1 ] || exit "$status"
+fi
 `], { timeout: 120000 });
+      try { fs.unlinkSync(this.credFile); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      this.cfg.shareOn = false;
+      this.save();
+      this.peerState = null;
+      this.sharePath = '';
       this.message = '';
+      return true;
     } catch (e) {
-      this.message = e.code === 126 ? 'Cancelled. The folder is still shared.' : e.message;
+      // Keep credentials and state available for a retry; never claim access was revoked.
+      this.message = 'Could not revoke sharing access. Try Off again: ' + e.message;
+      return false;
+    } finally {
+      this._busy('');
     }
-    try { fs.unlinkSync(this.credFile); } catch (_) { /* none */ }
-    this.cfg.shareOn = false;
-    this.save();
-    this.peerState = null;
-    await this.checkShare();
-    this._busy('');
   }
 
   // Is our share still set up? (its file is readable by everyone; no prompt)

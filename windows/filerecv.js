@@ -48,9 +48,18 @@ class FileRecv {
     if (!this.settings.files.acceptFromMac) return refuse('not_allowed');
     if (!(m.size >= 0) || m.size > P.FILE_MAX_BYTES) return refuse('too_big');
     const name = safeName(m.name);
-    fs.mkdirSync(this.dir, { recursive: true });
-    const tmp = path.join(this.dir, m.id + '.part');
-    const f = { id: m.id, name, size: m.size, got: 0, seq: 0, hash: crypto.createHash('sha256'), out: fs.createWriteStream(tmp), tmp, done: false };
+    // A transfer id is an opaque protocol token, never a filesystem path.
+    const tmp = path.join(this.dir, crypto.randomBytes(24).toString('hex') + '.part');
+    let fd;
+    try {
+      fs.mkdirSync(this.dir, { recursive: true });
+      fd = fs.openSync(tmp, 'wx', 0o600);
+    } catch (_) { return refuse('write_failed'); }
+    const f = { id: m.id, name, size: m.size, got: 0, seq: 0, hash: crypto.createHash('sha256'), out: fs.createWriteStream(tmp, { fd }), tmp, done: false };
+    f.out.on('error', (e) => {
+      f.out.once('close', () => { try { fs.unlinkSync(tmp); } catch (_) { /* gone */ } });
+      if (this.files.get(f.id) === f) this._finish(f, false, e.message);
+    });
     if (this.files.size === 0) this.target = null; // a new drag
     this.files.set(m.id, f);
     this.link.send({ t: T.FILE_ACCEPT, id: m.id });
@@ -127,6 +136,7 @@ class FileRecv {
     if (!f) return;
     this.files.delete(id);
     f.out.destroy();
+    f.out.once('close', () => { try { fs.unlinkSync(f.tmp); } catch (_) { /* gone */ } });
     try { fs.unlinkSync(f.tmp); } catch (_) { /* not written yet */ }
     if (!this.files.size) this.target = null;
     this.onChange();

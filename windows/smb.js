@@ -28,11 +28,15 @@ class Smb {
     this.mac = null;        // {share, user, password, port} from the Mac's smb.offer (memory only)
     this.drive = '';        // mapped drive letter for the Mac's share, e.g. 'Z:'
     this.mountMessage = '';
+    this.shareWork = Promise.resolve();
+    this.shareEpoch = 0;
+    this.revoking = false;
 
     this.link.on('welcome', () => this._offer());
     this.link.on(T.SMB_STATE, (m) => { if (m.share === SHARE) { this.peerState = { mounted: !!m.mounted, error: m.error || '' }; this.onChange(); } });
     this.link.on(T.SMB_OFFER, (m) => this._onMacOffer(m));
     this.link.on(T.SMB_REVOKE, (m) => this._unmount(m.share));
+    this._queueShare(() => this._reconcileShare());
   }
 
   get cfg() {
@@ -50,24 +54,42 @@ class Smb {
 
   _offer() {
     const c = this._creds();
-    if (this.cfg.shareOn && c) this.link.send({ t: T.SMB_OFFER, share: SHARE, user: c.user, password: c.password, port: 445 });
+    if (this.cfg.shareOn && !this.revoking && c) this.link.send({ t: T.SMB_OFFER, share: SHARE, user: c.user, password: c.password, port: 445 });
   }
 
-  // One switch: on → share the folder (default %USERPROFILE%\MacShare); the admin
-  // prompt only comes the first time or after the folder changed. Off → the Mac unmounts; the share
-  // and account stay, so switching on again needs no prompt.
-  async setShareOn(on) {
-    if (this.busy) return;
-    if (!on) {
-      this.cfg.shareOn = false;
+  async _reconcileShare() {
+    await this.checkShare();
+    if (!this.cfg.shareOn && (this.sharePath || fs.existsSync(this.credFile))) {
+      // Older versions saved Off without revoking native access. Show it as active
+      // until cleanup succeeds, including when the administrator prompt is declined.
+      this.cfg.shareOn = true;
+      this.revoking = true;
       this.save();
-      this.link.send({ t: T.SMB_REVOKE, share: SHARE });
-      this.peerState = null;
-      return this.onChange();
+      await this._unshare();
     }
+  }
+
+  _queueShare(action) {
+    const work = this.shareWork.then(action).catch((e) => { this._msg(e.message); return false; });
+    this.shareWork = work;
+    return work;
+  }
+
+  // Off revokes native access, including an Off requested while setup is in progress.
+  setShareOn(on) {
+    if (!on) return this.unshare();
+    const epoch = this.shareEpoch;
+    return this._queueShare(() => epoch === this.shareEpoch && this._setShareOn());
+  }
+
+  async _setShareOn() {
+    if (this.busy) return;
+    this.revoking = false;
+    const epoch = this.shareEpoch;
     const folder = this.cfg.shareFolder || path.join(os.homedir(), 'MacShare');
     try { fs.mkdirSync(folder, { recursive: true }); } catch (e) { return this._msg('Can’t create ' + folder + ': ' + e.message); }
     await this.checkShare();
+    if (epoch !== this.shareEpoch) return;
     if (this._creds() && this.sharePath && this.sharePath.toLowerCase() === folder.toLowerCase()) {
       this.cfg.shareOn = true;
       this.cfg.shareFolder = folder;
@@ -76,7 +98,7 @@ class Smb {
       this._offer();
       return this.onChange();
     }
-    await this.share(folder);
+    await this._share(folder);
   }
 
   // Choose… a different folder: shared right away if sharing is on, else remembered for later.
@@ -89,7 +111,16 @@ class Smb {
   }
 
   // One elevated script: account, folder permission, share, firewall (File and Printer Sharing, Private).
-  async share(folder) {
+  share(folder) {
+    const epoch = this.shareEpoch;
+    return this._queueShare(() => {
+      if (epoch !== this.shareEpoch) return false;
+      this.revoking = false;
+      return this._share(folder);
+    });
+  }
+
+  async _share(folder) {
     if (this.busy) return;
     if (!folder || !fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) return this._msg('Pick a folder first');
     if (!safeStorage.isEncryptionAvailable()) return this._msg('Windows can’t protect the password here (DPAPI unavailable)');
@@ -120,21 +151,35 @@ class Smb {
   }
 
   // Stop sharing: the Mac unmounts; the share and the account are removed (elevated).
-  async unshare() {
-    if (this.busy) return;
+  unshare() {
+    this.shareEpoch++;
+    this.revoking = true;
+    return this._queueShare(() => this._unshare());
+  }
+
+  async _unshare() {
     this.link.send({ t: T.SMB_REVOKE, share: SHARE });
     this._busy('remove');
+    const result = path.join(app.getPath('userData'), 'smb-remove-' + crypto.randomBytes(12).toString('hex') + '.txt');
     try {
-      await scriptElevated('smb-unshare', { Share: SHARE, User: USER });
+      await scriptElevated('smb-unshare', { Share: SHARE, User: USER, Result: result });
+      const status = fs.existsSync(result) ? fs.readFileSync(result, 'utf8').trim() : 'Removal did not finish';
+      if (status !== 'ok') throw new Error(status);
+      try { fs.unlinkSync(this.credFile); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      this.cfg.shareOn = false;
+      this.save();
+      this.peerState = null;
+      this.sharePath = '';
       this.message = '';
+      return true;
     } catch (e) {
-      this.message = /cancel/i.test(e.message) ? 'Cancelled. The folder is still shared.' : e.message;
+      // Keep credentials and state available for a retry; never claim access was revoked.
+      this.message = 'Could not revoke sharing access. Try Off again: ' + e.message;
+      return false;
+    } finally {
+      try { fs.unlinkSync(result); } catch (_) { /* none */ }
+      this._busy('');
     }
-    try { fs.unlinkSync(this.credFile); } catch (_) { /* none */ }
-    this.cfg.shareOn = false;
-    this.save();
-    this.peerState = null;
-    this._busy('');
   }
 
   // Does Windows still have our share? (shown in the UI; no elevation needed)

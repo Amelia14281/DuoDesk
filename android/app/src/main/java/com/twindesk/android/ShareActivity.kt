@@ -111,15 +111,25 @@ class RezumeActivity : Activity() {
     private fun toast(t: String) = Toast.makeText(applicationContext, t, Toast.LENGTH_SHORT).show()
 }
 
-// The home screen shortcut "Wireless debugging": on at once if the Mac granted it, else the setting.
+// Exported for the launcher shortcut. An external intent must never enable debugging by itself.
 class AdbActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val core = Core.get(this)
-        if (core.adb.enable(true, byPerson = true)) {
-            core.adb.sendState()
-            Toast.makeText(applicationContext, "Wireless debugging is on", Toast.LENGTH_SHORT).show()
-        } else core.adb.openSettings()
-        finish()
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setTitle("Enable debugging?")
+            .setMessage("This turns on developer options, USB debugging and wireless debugging, and keeps debugging authorization from expiring. Authorized computers can control this phone. Only continue if you requested this.")
+            .setNegativeButton(android.R.string.cancel) { _, _ -> finish() }
+            .setPositiveButton("Enable debugging") { _, _ ->
+                val core = Core.get(this)
+                if (core.adb.enable(true, byPerson = true)) {
+                    core.adb.sendState()
+                    Toast.makeText(applicationContext, "Wireless debugging is on", Toast.LENGTH_SHORT).show()
+                } else core.adb.openSettings()
+                finish()
+            }
+            .setOnCancelListener { finish() }
+            .create()
+        dialog.show()
+        dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).filterTouchesWhenObscured = true
     }
 }
